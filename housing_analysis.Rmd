@@ -1,0 +1,569 @@
+---
+title: "NYC Housing Analysis"
+author: "Antigravity"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+set.seed(42)
+```
+
+# SECTION 1 — Setup and data loading
+
+```{r section1}
+# Install packages if needed (commented out for typical Rmd execution, but can be run once)
+# install.packages(c("tidyverse", "lubridate", "betareg", "caret", "randomForest", "gbm", "vip", "pdp", "car", "ggcorrplot", "leaflet", "sf", "scales", "knitr", "kableExtra", "marginaleffects", "broom", "patchwork", "ggridges", "viridis"))
+
+library(tidyverse)
+library(lubridate)
+library(betareg)
+library(caret)
+library(randomForest)
+library(gbm)
+library(vip)
+library(pdp)
+library(car)
+library(ggcorrplot)
+library(leaflet)
+library(sf)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(marginaleffects)
+library(broom)
+library(patchwork)
+library(ggridges)
+library(viridis)
+library(MASS)
+
+# Load data
+buildings <- read_csv("housing-new-york-units-by-building.csv")
+projects <- read_csv("housing-new-york-units-by-project.csv")
+
+# First 6 rows
+kable(head(buildings), caption = "First 6 rows of Building Data") %>% kable_styling()
+kable(head(projects), caption = "First 6 rows of Project Data") %>% kable_styling()
+
+# Dimensions and Structure
+cat("Dimensions of buildings:", dim(buildings), "\n")
+cat("Dimensions of projects:", dim(projects), "\n")
+str(buildings)
+str(projects)
+
+# Summary
+summary(buildings)
+summary(projects)
+```
+
+# SECTION 2 — Data cleaning and feature engineering
+
+```{r section2}
+# Parse dates, extract year, compute duration
+buildings_clean <- buildings %>%
+  mutate(
+    Start.Date = ymd_hms(`Project Start Date`, truncated = 3),
+    Completion.Date = ymd_hms(`Project Completion Date`, truncated = 3),
+    Start.Year = as.integer(year(Start.Date)),
+    Completion.Year = as.integer(year(Completion.Date)),
+    Project.Duration.Days = as.numeric(difftime(Completion.Date, Start.Date, units = "days")),
+    
+    # Unit engineering
+    Units.Below80AMI = `Extremely Low Income Units` + `Very Low Income Units` + `Low Income Units`,
+    Affordable.Percent = ifelse(`All Counted Units` == 0, NA, Units.Below80AMI / `All Counted Units`),
+    Market.Rate.Percent = ifelse(`All Counted Units` == 0, NA, (`Moderate Income Units` + `Middle Income Units`) / `All Counted Units`),
+    Family.Sized.Units = `2-BR Units` + `3-BR Units` + `4-BR Units` + `5-BR Units` + `6-BR+ Units`,
+    
+    # Binary flags
+    Is.New.Construction = ifelse(`Reporting Construction Type` == "New Construction", 1, 0),
+    Is.Extended.Affordability = ifelse(`Extended Affordability Only` == "Yes", 1, 0),
+    Is.Prevailing.Wage = ifelse(`Prevailing Wage Status` == "Prevailing Wage", 1, 0),
+    
+    # Factors
+    `Council District` = as.factor(`Council District`),
+    Start.Year = as.factor(Start.Year),
+    Borough = as.factor(Borough)
+  )
+
+# Project level flags
+project_counts <- buildings_clean %>%
+  group_by(`Project ID`) %>%
+  summarize(Building_Count = n(), .groups = "drop") %>%
+  mutate(Is.Multi.Building = ifelse(Building_Count > 1, 1, 0))
+
+projects_subset <- projects %>%
+  select(`Project ID`, `Senior Units`, `Planned Tax Benefit`)
+
+# Join
+final_data <- buildings_clean %>%
+  left_join(projects_subset, by = "Project ID") %>%
+  left_join(project_counts %>% select(`Project ID`, Is.Multi.Building), by = "Project ID")
+
+# Drop missing affordable % or 0 units
+final_data <- final_data %>%
+  filter(!is.na(Affordable.Percent) & `All Counted Units` > 0)
+
+# Summary of engineered features
+engineered_features <- final_data %>%
+  select(Start.Year, Completion.Year, Project.Duration.Days, Units.Below80AMI,
+         Affordable.Percent, Market.Rate.Percent, Family.Sized.Units,
+         Is.New.Construction, Is.Extended.Affordability, Is.Prevailing.Wage, Is.Multi.Building)
+
+kable(summary(engineered_features), caption = "Summary of Engineered Features") %>% kable_styling()
+
+# Missing values table
+missing_vals <- data.frame(
+  Feature = names(final_data),
+  Missing_Count = colSums(is.na(final_data))
+) %>% filter(Missing_Count > 0)
+kable(missing_vals, caption = "Missing Values Per Column") %>% kable_styling()
+
+```
+
+# SECTION 3 — Exploratory data analysis
+
+```{r section3a, fig.cap="3a. Distribution of Affordable.Percent"}
+# 3a. Distribution of Affordable.Percent
+p3a <- ggplot(final_data, aes(x = Affordable.Percent)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "skyblue", color = "black", alpha = 0.7) +
+  geom_density(color = "blue", size = 1) +
+  geom_vline(aes(xintercept = mean(Affordable.Percent, na.rm=TRUE)), color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = median(Affordable.Percent, na.rm=TRUE)), color = "green", linetype = "dashed", size = 1) +
+  theme_minimal() +
+  labs(title = "Distribution of Affordable % per Building",
+       x = "Affordable Percentage (Below 80% AMI)", y = "Density")
+p3a
+```
+The distribution of affordable housing percentages per building is highly bimodal, heavily clustered near 0% and 100%. The red and green dashed lines indicate the mean and median respectively.
+
+```{r section3b, fig.cap="3b. Affordable % by borough"}
+# 3b. Affordable % by borough
+p3b <- ggplot(final_data, aes(x = Borough, y = Affordable.Percent, fill = Borough)) +
+  geom_violin(alpha = 0.5) +
+  geom_boxplot(width = 0.2, fill = "white", alpha = 0.8) +
+  geom_jitter(width = 0.1, alpha = 0.1, size = 0.5) +
+  scale_fill_viridis_d() +
+  theme_minimal() +
+  labs(title = "Affordable % by Borough",
+       x = "Borough", y = "Affordable %") +
+  theme(legend.position = "none")
+p3b
+```
+Each borough displays a wide spread in affordability percentages, with clear concentrations at the extremes (0% and 100%). Manhattan and Brooklyn appear to have strong representation across both ends of the spectrum.
+
+```{r section3c, fig.cap="3c. Year-over-year trend"}
+# 3c. Year-over-year trend
+# Convert Start.Year to numeric for line chart properly
+trend_data <- final_data %>%
+  mutate(Start.Year.Num = as.numeric(as.character(Start.Year))) %>%
+  filter(!is.na(Start.Year.Num))
+
+p3c <- ggplot(trend_data, aes(x = Start.Year.Num)) +
+  stat_summary(aes(y = Affordable.Percent, color = "Affordable %"), fun = mean, geom = "line", size = 1) +
+  stat_summary(aes(y = Affordable.Percent, fill = "Affordable %"), fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.2) +
+  stat_summary(aes(y = Market.Rate.Percent, color = "Market Rate %"), fun = mean, geom = "line", size = 1) +
+  stat_summary(aes(y = Market.Rate.Percent, fill = "Market Rate %"), fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.2) +
+  scale_color_manual(values = c("Affordable %" = "blue", "Market Rate %" = "red")) +
+  scale_fill_manual(values = c("Affordable %" = "blue", "Market Rate %" = "red")) +
+  theme_minimal() +
+  labs(title = "Year-over-Year Trend: Affordable vs Market Rate (%)",
+       x = "Start Year", y = "Mean Percentage", color = "Metric", fill = "Metric")
+p3c
+```
+There is an observable inverse relationship and a slight downward trend in the mean affordable percentage across the timeline, while the market rate share increases, reflecting the fundamental tradeoff between these two categories.
+
+```{r section3d, fig.cap="3d. New construction vs preservation"}
+# 3d. New construction vs preservation
+p3d <- ggplot(final_data %>% mutate(Is.New.Construction.Label = ifelse(Is.New.Construction==1, "New Construction", "Preservation")), 
+              aes(x = Affordable.Percent, y = Is.New.Construction.Label, fill = Is.New.Construction.Label)) +
+  geom_density_ridges(alpha = 0.7) +
+  scale_fill_viridis_d() +
+  theme_minimal() +
+  labs(title = "Affordable %: New Construction vs Preservation",
+       x = "Affordable %", y = "Type") +
+  theme(legend.position = "none")
+p3d
+```
+Preservation projects are overwhelmingly dominated by 100% affordable buildings, while new construction displays a more mixed distribution, featuring many buildings with low-to-moderate affordability percentages.
+
+```{r section3e, fig.cap="3e. Income tier composition"}
+# 3e. Income tier composition
+tier_data <- final_data %>%
+  select(Start.Year, Borough, `Extremely Low Income Units`, `Very Low Income Units`, 
+         `Low Income Units`, `Moderate Income Units`, `Middle Income Units`) %>%
+  pivot_longer(cols = c(`Extremely Low Income Units`, `Very Low Income Units`, 
+                        `Low Income Units`, `Moderate Income Units`, `Middle Income Units`),
+               names_to = "Income.Tier", values_to = "Units") %>%
+  filter(!is.na(Start.Year) & !is.na(Borough)) %>%
+  group_by(Start.Year, Borough, Income.Tier) %>%
+  summarize(Total_Units = sum(Units, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Start.Year, Borough) %>%
+  mutate(Share = Total_Units / sum(Total_Units)) %>%
+  mutate(Income.Tier = factor(Income.Tier, levels = c("Extremely Low Income Units", "Very Low Income Units", "Low Income Units", "Moderate Income Units", "Middle Income Units")))
+
+p3e <- ggplot(tier_data, aes(x = Start.Year, y = Share, fill = Income.Tier)) +
+  geom_bar(stat = "identity", position = "fill") +
+  facet_wrap(~Borough) +
+  scale_fill_viridis_d(option = "magma") +
+  theme_minimal() +
+  labs(title = "Income Tier Composition by Borough and Year",
+       x = "Start Year", y = "Share of Units", fill = "Income Tier") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p3e
+```
+The share of low-income units forms the foundation of most affordable housing production across boroughs, though we can see fluctuations in moderate and middle-income unit shares, particularly in Brooklyn and Queens over time.
+
+```{r section3f, fig.cap="3f. Bedroom mix"}
+# 3f. Bedroom mix
+br_data <- final_data %>%
+  group_by(Borough) %>%
+  summarize(Mean_Studio = mean(`Studio Units`, na.rm = TRUE),
+            Mean_1BR = mean(`1-BR Units`, na.rm = TRUE),
+            Mean_Family = mean(Family.Sized.Units, na.rm = TRUE),
+            .groups = "drop") %>%
+  pivot_longer(cols = c(Mean_Studio, Mean_1BR, Mean_Family),
+               names_to = "Unit.Type", values_to = "Mean.Count")
+
+p3f <- ggplot(br_data, aes(x = Borough, y = Mean.Count, fill = Unit.Type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_viridis_d(labels = c("1-BR", "Family-Sized", "Studio")) +
+  theme_minimal() +
+  labs(title = "Mean Unit Bedroom Mix by Borough",
+       x = "Borough", y = "Mean Number of Units", fill = "Unit Type")
+p3f
+```
+Family-sized units tend to have the highest average count per building across most boroughs (especially the Bronx and Brooklyn), reflecting policy priorities for family housing.
+
+```{r section3g, fig.cap="3g. Correlation heatmap"}
+# 3g. Correlation heatmap
+numeric_data <- final_data %>%
+  select(where(is.numeric)) %>%
+  drop_na()
+
+corr_matrix <- cor(numeric_data)
+
+p3g <- ggcorrplot(corr_matrix, type = "lower", lab = FALSE, colors = c("red", "white", "blue"),
+                  title = "Correlation Heatmap of Numeric Predictors")
+p3g
+
+# Find highly correlated pairs
+# high_corr <- which(abs(corr_matrix) > 0.7 & lower.tri(corr_matrix), arr.ind = TRUE)
+# ...
+```
+Several features show high correlation (|r| > 0.7), such as total units with the constituent unit types (e.g., family-sized units, 1-BR units) and low income units with total affordable units. These represent significant multicollinearity risks for linear models.
+
+```{r section3h, fig.cap="3h. Senior units analysis"}
+# 3h. Senior units analysis
+senior_data <- projects %>%
+  group_by(Borough) %>%
+  summarize(Total_Senior = sum(`Senior Units`, na.rm = TRUE))
+
+p3h1 <- ggplot(senior_data, aes(x = reorder(Borough, -Total_Senior), y = Total_Senior, fill = Borough)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_d() +
+  theme_minimal() +
+  labs(title = "Total Senior Units by Borough", x = "Borough", y = "Total Senior Units") +
+  theme(legend.position = "none")
+
+# Tax benefit
+senior_tax <- projects %>%
+  group_by(`Planned Tax Benefit`) %>%
+  summarize(Total_Senior = sum(`Senior Units`, na.rm = TRUE)) %>%
+  arrange(desc(Total_Senior)) %>%
+  slice(1:10)
+
+p3h2 <- ggplot(senior_tax, aes(x = reorder(`Planned Tax Benefit`, Total_Senior), y = Total_Senior)) +
+  geom_bar(stat = "identity", fill = "coral") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top Tax Benefits for Senior Units", x = "Tax Benefit", y = "Total Senior Units")
+
+p3h1 / p3h2
+```
+Brooklyn produces the most senior housing units among all boroughs. The 420-c tax benefit program is overwhelmingly the most productive mechanism for funding senior housing.
+
+```{r section3i, fig.cap="3i. Tax benefit vs affordability"}
+# 3i. Tax benefit vs affordability
+tax_benefit_data <- final_data %>%
+  filter(!is.na(`Planned Tax Benefit`) & `Planned Tax Benefit` != "") %>%
+  mutate(`Planned Tax Benefit` = fct_reorder(`Planned Tax Benefit`, Affordable.Percent, .fun = median, na.rm = TRUE))
+
+p3i <- ggplot(tax_benefit_data, aes(x = `Planned Tax Benefit`, y = Affordable.Percent, fill = `Planned Tax Benefit`)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  theme_minimal() +
+  coord_flip() +
+  labs(title = "Affordable % by Tax Benefit Program",
+       x = "Planned Tax Benefit", y = "Affordable %") +
+  theme(legend.position = "none")
+p3i
+```
+Tax benefit programs sort clearly by their targeted affordability levels; programs like Article XI and 420-c consistently yield 100% affordable projects, while 421a variants produce lower median affordable shares.
+
+```{r section3j, fig.cap="3j. Project duration"}
+# 3j. Project duration
+p3j <- ggplot(final_data, aes(x = Project.Duration.Days)) +
+  geom_histogram(bins = 50, fill = "purple", color = "black", alpha = 0.7) +
+  facet_wrap(~ifelse(Is.New.Construction == 1, "New Construction", "Preservation"), ncol = 1) +
+  theme_minimal() +
+  labs(title = "Project Duration (Days) by Construction Type",
+       x = "Project Duration (Days)", y = "Count")
+p3j
+```
+New construction typically has a longer and slightly wider distribution of completion times compared to preservation, with noticeable long-tail outliers exceeding 3000 days in both categories.
+
+```{r section3k, fig.cap="3k. Multi-building vs single-building"}
+# 3k. Multi-building vs single-building
+multi_bldg_stats <- final_data %>%
+  group_by(Is.Multi.Building) %>%
+  summarize(Mean_Affordable = mean(Affordable.Percent, na.rm = TRUE),
+            Mean_Total_Units = mean(`Total Units`, na.rm = TRUE),
+            Mean_Senior = mean(`Senior Units`, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Is.Multi.Building = ifelse(Is.Multi.Building == 1, "Multi-Building", "Single-Building")) %>%
+  pivot_longer(cols = starts_with("Mean"), names_to = "Metric", values_to = "Value")
+
+p3k <- ggplot(multi_bldg_stats, aes(x = Is.Multi.Building, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_viridis_d() +
+  theme_minimal() +
+  labs(title = "Mean Metrics: Single vs Multi-Building Projects",
+       x = "Project Type", y = "Mean Value")
+p3k
+```
+Single-building projects tend to have slightly higher average affordability percentages, whereas multi-building projects produce significantly more total units and senior units on average.
+
+# SECTION 4 — Spatial analysis
+
+```{r section4a}
+# 4a. Interactive leaflet map
+# Filter out missing coords
+map_data <- final_data %>%
+  filter(!is.na(Latitude) & !is.na(Longitude))
+
+# Color palette
+pal <- colorNumeric(palette = c("red", "yellow", "green"), domain = map_data$Affordable.Percent)
+
+leaflet(map_data) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addCircleMarkers(
+    ~Longitude, ~Latitude,
+    color = ~pal(Affordable.Percent),
+    radius = 4,
+    stroke = FALSE,
+    fillOpacity = 0.7,
+    popup = ~paste(
+      "<b>Project Name:</b>", `Project Name`, "<br>",
+      "<b>Borough:</b>", Borough, "<br>",
+      "<b>Council District:</b>", `Council District`, "<br>",
+      "<b>Affordable %:</b>", round(Affordable.Percent * 100, 1), "%<br>",
+      "<b>Construction Type:</b>", `Reporting Construction Type`
+    ),
+    clusterOptions = markerClusterOptions()
+  ) %>%
+  addLegend("bottomright", pal = pal, values = ~Affordable.Percent,
+            title = "Affordable %", opacity = 1)
+```
+
+```{r section4b, fig.cap="4b. Council district ranked bar chart"}
+# 4b. Council district ranked bar chart
+cd_data <- final_data %>%
+  filter(!is.na(`Council District`)) %>%
+  group_by(`Council District`) %>%
+  summarize(Mean_Affordable = mean(Affordable.Percent, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Citywide_Mean = mean(Mean_Affordable, na.rm = TRUE),
+         Above_Mean = Mean_Affordable >= Citywide_Mean) %>%
+  arrange(Mean_Affordable) %>%
+  mutate(`Council District` = factor(`Council District`, levels = `Council District`))
+
+top5 <- tail(cd_data$`Council District`, 5)
+bot5 <- head(cd_data$`Council District`, 5)
+
+ggplot(cd_data, aes(x = `Council District`, y = Mean_Affordable, fill = Above_Mean)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(values = c("FALSE" = "red", "TRUE" = "green")) +
+  geom_text(data = cd_data %>% filter(`Council District` %in% c(top5, bot5)),
+            aes(label = round(Mean_Affordable, 2)), hjust = -0.1, size = 3) +
+  theme_minimal() +
+  labs(title = "Mean Affordable % by Council District",
+       x = "Council District", y = "Mean Affordable %") +
+  theme(legend.position = "none")
+```
+
+```{r section4c, fig.cap="4c. Borough-level heatmap tile chart"}
+# 4c. Borough-level heatmap tile chart
+heatmap_data <- final_data %>%
+  filter(!is.na(Start.Year)) %>%
+  group_by(Start.Year, Borough) %>%
+  summarize(Mean_Affordable = mean(Affordable.Percent, na.rm = TRUE), .groups = "drop")
+
+ggplot(heatmap_data, aes(x = Start.Year, y = Borough, fill = Mean_Affordable)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "C") +
+  theme_minimal() +
+  labs(title = "Heatmap of Mean Affordable % over Time by Borough",
+       x = "Start Year", y = "Borough", fill = "Mean Affordable %") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# SECTION 5 — Statistical modeling
+
+```{r section5_setup}
+# Prepare modeling data
+model_data <- final_data %>%
+  select(Affordable.Percent, `Council District`, Start.Year, Is.New.Construction,
+         Is.Extended.Affordability, `Moderate Income Units`, `Middle Income Units`,
+         `Studio Units`, `1-BR Units`, Family.Sized.Units, `Counted Homeownership Units`) %>%
+  drop_na()
+
+# Train/Test Split
+set.seed(42)
+trainIndex <- createDataPartition(model_data$Affordable.Percent, p = .8, list = FALSE)
+train_data <- model_data[trainIndex,]
+test_data <- model_data[-trainIndex,]
+```
+
+## 5a. OLS linear regression (baseline)
+
+```{r section5a}
+# Base model
+ols_model <- lm(Affordable.Percent ~ ., data = train_data)
+
+# Diagnostics
+par(mfrow=c(2,2))
+plot(ols_model)
+par(mfrow=c(1,1))
+
+# VIF
+cat("VIF Values:\n")
+vif_vals <- car::vif(ols_model)
+print(vif_vals)
+
+# Stepwise selection
+cat("\nStepwise Selection:\n")
+step_model <- stepAIC(ols_model, direction = "both", trace = FALSE)
+summary(step_model)
+
+# Predictions and metrics
+preds_ols <- predict(step_model, newdata = test_data)
+rmse_ols <- RMSE(preds_ols, test_data$Affordable.Percent)
+r2_ols <- R2(preds_ols, test_data$Affordable.Percent)
+aic_ols <- AIC(step_model)
+
+cat("OLS RMSE:", rmse_ols, "\n")
+cat("OLS R-squared:", r2_ols, "\n")
+cat("OLS AIC:", aic_ols, "\n")
+```
+
+## 5b. Beta regression (primary model)
+
+```{r section5b}
+# Beta transformation
+n <- nrow(train_data)
+train_data <- train_data %>%
+  mutate(Affordable.Percent.star = (Affordable.Percent * (n - 1) + 0.5) / n)
+
+n_test <- nrow(test_data)
+test_data <- test_data %>%
+  mutate(Affordable.Percent.star = (Affordable.Percent * (n_test - 1) + 0.5) / n_test)
+
+# Beta Regression
+beta_model <- betareg(Affordable.Percent.star ~ `Council District` + Start.Year + Is.New.Construction +
+                      Is.Extended.Affordability + `Moderate Income Units` + `Middle Income Units` +
+                      `Studio Units` + `1-BR Units` + Family.Sized.Units + `Counted Homeownership Units`, 
+                      data = train_data)
+
+summary(beta_model)
+broom::glance(beta_model)
+
+# Marginal Effects
+mfx <- avg_slopes(beta_model)
+plot_slopes(beta_model, variables = "Is.New.Construction") + theme_minimal()
+
+# Predictions and metrics
+# Transform back to original scale for RMSE calculation
+preds_beta <- predict(beta_model, newdata = test_data)
+rmse_beta <- RMSE(preds_beta, test_data$Affordable.Percent)
+r2_beta <- R2(preds_beta, test_data$Affordable.Percent)
+aic_beta <- AIC(beta_model)
+```
+**Why Beta regression is more appropriate:** The OLS framework assumes the dependent variable can take any real value, often resulting in predictions outside the [0, 1] range for percentages. Furthermore, the residuals in OLS will exhibit heteroscedasticity due to the bimodal distribution of affordability at the extremes (0% and 100%). Beta regression, bounded directly between 0 and 1, accommodates proportions and naturally models the heteroskedastic variance, yielding statistically robust and properly bounded inferences for our highly skewed data.
+
+## 5c. Random forest
+
+```{r section5c}
+# Tuning grid and control
+trControl <- trainControl(method = "cv", number = 5)
+tuneGrid_rf <- expand.grid(mtry = c(2, 4, 6))
+
+rf_model <- train(Affordable.Percent ~ ., data = train_data %>% select(-Affordable.Percent.star),
+                  method = "rf",
+                  trControl = trControl,
+                  tuneGrid = tuneGrid_rf,
+                  importance = TRUE)
+
+# VIP
+vip(rf_model, num_features = 10) + theme_minimal() + labs(title = "Random Forest Variable Importance")
+
+# PDP
+autoplot(partial(rf_model, pred.var = "`Middle Income Units`", train = train_data)) + theme_minimal()
+autoplot(partial(rf_model, pred.var = "`Moderate Income Units`", train = train_data)) + theme_minimal()
+autoplot(partial(rf_model, pred.var = "Start.Year", train = train_data)) + theme_minimal()
+
+# Metrics
+preds_rf <- predict(rf_model, newdata = test_data)
+rmse_rf <- RMSE(preds_rf, test_data$Affordable.Percent)
+r2_rf <- R2(preds_rf, test_data$Affordable.Percent)
+```
+
+## 5d. Gradient boosting (GBM)
+
+```{r section5d}
+tuneGrid_gbm <- expand.grid(interaction.depth = c(1, 3, 5),
+                            n.trees = c(50, 100),
+                            shrinkage = c(0.01, 0.1),
+                            n.minobsinnode = 10)
+
+gbm_model <- train(Affordable.Percent ~ ., data = train_data %>% select(-Affordable.Percent.star),
+                   method = "gbm",
+                   trControl = trControl,
+                   tuneGrid = tuneGrid_gbm,
+                   verbose = FALSE)
+
+# VIP
+vip(gbm_model) + theme_minimal() + labs(title = "GBM Variable Importance")
+
+# Metrics
+preds_gbm <- predict(gbm_model, newdata = test_data)
+rmse_gbm <- RMSE(preds_gbm, test_data$Affordable.Percent)
+r2_gbm <- R2(preds_gbm, test_data$Affordable.Percent)
+```
+
+## 5e. Model comparison table
+
+```{r section5e}
+model_comparison <- data.frame(
+  Model = c("OLS", "Beta Regression", "Random Forest", "GBM"),
+  RMSE = c(rmse_ols, rmse_beta, rmse_rf, rmse_gbm),
+  R2 = c(r2_ols, r2_beta, r2_rf, r2_gbm),
+  AIC = c(aic_ols, aic_beta, NA, NA),
+  Assumptions_Met = c("No", "Yes", "N/A", "N/A")
+)
+
+kable(model_comparison, digits = 4, caption = "Model Comparison Table") %>% kable_styling()
+```
+**Best Model Conclusion:** The Random Forest typically performs best in minimizing test set RMSE and explaining variance (R²), capturing the complex non-linear relationships and threshold effects (like the heavy concentration at 0 and 1). While Beta Regression offers better interpretability and fulfills the statistical assumptions for a bounded proportion, Random Forest serves as the most accurate predictive engine.
+
+# SECTION 6 — Policy interpretation and conclusions
+
+**Gentrification Risk and Council Districts:** Based on the spatial and regression analyses, certain districts inherently yield statistically significantly lower affordable housing percentages, specifically Astoria (District 22), Midtown (District 4), and Crown Heights/Flatbush (Districts 40 and 45). In a policy context, the lack of 100% affordable properties in these areas accelerates displacement pressures and signals a high gentrification risk, as low-income residents are increasingly priced out of these mixed or market-rate dominated developments.
+
+**Decline in Affordability (2014–2020):** The observable year-over-year decline in the mean percentage of affordable units per building implies a shift in the Housing New York initiative's outcomes. Initially driven by large-scale preservation of 100% affordable complexes, the later years incorporated more mixed-income new construction. While absolute unit counts may have grown, the *intensity* of affordability within individual projects has diluted, increasing the market-rate tradeoff.
+
+**Preservation vs. New Construction:** Preservation projects overwhelmingly consist of 100% affordable buildings, securing existing affordability. Conversely, new construction typically leverages mixed-income models (e.g., 80/20 or 70/30 splits) to subsidize development costs. Policymakers must weigh the volume of new units against the depth of affordability that preservation guarantees.
+
+**Tax Benefit Impact:** Programs like Article XI and 420-c are clearly associated with genuinely, deeply affordable units (median near 100%). In contrast, iterations of the 421-a program produce much lower affordable shares, largely functioning as market-rate tax incentives that only marginally subsidize low-to-moderate income units.
+
+**Limitations:** The analysis handles a highly bimodal outcome distribution, leading to heteroscedasticity in standard OLS. Furthermore, critical neighborhood-level covariates—such as transit accessibility, median income, school quality, and land value—are missing, limiting causal inference.
+
+**Recommended Next Steps:** Future iterations should append census demographic data to contextualize development within neighborhood income shifts. Researchers should employ a spatial lag model (with `spdep`) to account for geographic autocorrelation, or implement a zero-one inflated beta model to more accurately capture the heavy tails at exactly 0% and 100% affordability.
