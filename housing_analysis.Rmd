@@ -36,7 +36,6 @@ library(broom)
 library(patchwork)
 library(ggridges)
 library(viridis)
-library(MASS)
 
 # Load data
 buildings <- read_csv("housing-new-york-units-by-building.csv")
@@ -441,7 +440,7 @@ print(vif_vals)
 
 # Stepwise selection
 cat("\nStepwise Selection:\n")
-step_model <- stepAIC(ols_model, direction = "both", trace = FALSE)
+step_model <- MASS::stepAIC(ols_model, direction = "both", trace = FALSE)
 summary(step_model)
 
 # Predictions and metrics
